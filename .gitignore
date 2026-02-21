@@ -1,0 +1,14 @@
+# Ignore everything
+*
+
+# Allow Python files
+!*.py
+
+# Allow config/project files
+!.gitignore
+!requirements.txt
+!README.md
+
+# Still ignore Python caches
+__pycache__/
+*.py[cod]

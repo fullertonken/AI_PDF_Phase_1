@@ -1,0 +1,18 @@
+# PDF Invoice Processor - Phase 1 Dependencies
+# Install with: pip install -r requirements.txt
+
+# PDF manipulation
+pypdf>=4.0
+pdfplumber>=0.10
+
+# Image processing & OCR
+Pillow>=10.0
+pytesseract>=0.3.10
+pdf2image>=1.16  # requires poppler-utils system package
+#ocrmypdf>=16.0   # requires tesseract-ocr system package
+
+# GUI
+# tkinter is part of Python's standard library - no pip install needed
+
+# Utilities
+tqdm>=4.65  # progress bars
