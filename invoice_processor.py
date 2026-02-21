@@ -1,38 +1,70 @@
 """
-PDF Invoice Processor - Phase 2: Classification, Grouping & Extraction
+PDF Invoice Processor — Unified Pipeline
 
-Reads the manifest.json from Phase 1, uses Ollama with a VISION model
-(qwen3-vl:8b) to analyze page images directly:
-  1. Classify each page by looking at its image
-  2. Group pages into invoices (text-based, using classification results)
-  3. Extract structured fields by looking at invoice page images
-  4. Output results as a CSV/XLSX spreadsheet
+Combines document preparation (splitting, orientation, OCR) and
+AI-powered extraction (classify, group, extract) into a single
+tabbed application.
 
-The vision model sees the actual document layout — tables, headers, logos,
-spatial positioning — rather than relying on OCR text alone. OCR text from
-Phase 1 is optionally included as supplementary context.
+Tab 1 — Document Preparation:
+  Reads PDFs, splits multi-page files into single pages, detects and
+  corrects orientation, applies OCR where needed.
 
-All processing is local via Ollama — no data leaves the machine.
+Tab 2 — Vision Extraction:
+  Uses Ollama with a vision model to classify pages, group them into
+  invoices, and extract structured fields to CSV/XLSX.
+
+All processing is done locally — no data leaves the machine.
 
 Requirements:
-    - Phase 1 output (manifest.json + processed PDFs + images/)
-    - Ollama running locally with qwen3-vl:8b model
-    - Python: openpyxl, pdfplumber, Pillow
+    System: tesseract-ocr, poppler-utils, ghostscript
+    Python: pypdf, pytesseract, pdf2image, Pillow, ocrmypdf, pdfplumber,
+            tqdm, deskew, numpy, openpyxl
+    Ollama: running locally with a vision model (e.g. qwen3-vl:8b)
 """
 
 import os
 import sys
 import csv
 import json
+import shutil
 import logging
-import threading
 import subprocess
+import threading
+import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# PDF / Image / OCR imports
+# ---------------------------------------------------------------------------
+try:
+    from pypdf import PdfReader, PdfWriter
+except ImportError:
+    sys.exit("Missing 'pypdf'. Run: pip install pypdf")
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit("Missing 'Pillow'. Run: pip install Pillow")
+
+try:
+    import pytesseract
+except ImportError:
+    sys.exit("Missing 'pytesseract'. Run: pip install pytesseract")
+
+try:
+    from pdf2image import convert_from_path
+except ImportError:
+    sys.exit("Missing 'pdf2image'. Run: pip install pdf2image")
+
+try:
+    import pdfplumber
+except ImportError:
+    sys.exit("Missing 'pdfplumber'. Run: pip install pdfplumber")
 
 try:
     from openpyxl import Workbook
@@ -41,9 +73,9 @@ except ImportError:
     sys.exit("Missing 'openpyxl'. Run: pip install openpyxl")
 
 try:
-    import pdfplumber
+    from tqdm import tqdm
 except ImportError:
-    sys.exit("Missing 'pdfplumber'. Run: pip install pdfplumber")
+    tqdm = None
 
 from ollama_client import OllamaClient, OllamaError
 from prompts import (
@@ -56,15 +88,40 @@ from prompts import (
     EXTRACT_KEY_FIELDS_PROMPT,
 )
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+TEXT_THRESHOLD = 40
+OCR_DPI = 300
+ORIENTATION_CONFIDENCE = 2.0
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
-MAX_TEXT_LENGTH = 4000  # truncate supplementary OCR text
-MAX_IMAGES_PER_EXTRACTION = 4  # max pages to send as images in one call
+MAX_TEXT_LENGTH = 4000
+MAX_IMAGES_PER_EXTRACTION = 4
 LOW_CONFIDENCE_RETRY_THRESHOLD = 0.6
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Data classes
-# ---------------------------------------------------------------------------
+# ===========================================================================
+@dataclass
+class PageRecord:
+    """Metadata for a single processed page (Phase 1 output)."""
+    page_id: str
+    source_pdf: str
+    source_pdf_basename: str
+    original_page: int
+    total_source_pages: int
+    orientation_detected: int
+    orientation_correction: int
+    orientation_confidence: float
+    had_text: bool
+    ocr_applied: bool
+    text_length: int
+    output_pdf: str
+    output_image: str
+    processing_notes: list = field(default_factory=list)
+
+
 @dataclass
 class PageClassification:
     page_id: str
@@ -116,15 +173,16 @@ class InvoiceRecord:
     group_type: str
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def get_page_text(pdf_path: str) -> str:
-    """Extract text from a single-page PDF (supplementary to vision)."""
+# ===========================================================================
+# Shared helpers
+# ===========================================================================
+def extract_page_text(pdf_path: str, page_num: int = 0) -> str:
+    """Extract embedded text from a single page of a PDF using pdfplumber."""
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            if pdf.pages:
-                return (pdf.pages[0].extract_text() or "").strip()
+            if page_num < len(pdf.pages):
+                text = pdf.pages[page_num].extract_text() or ""
+                return text.strip()
     except Exception:
         pass
     return ""
@@ -158,6 +216,346 @@ def _first_non_empty(*vals):
     return None
 
 
+def check_system_dependencies() -> list[str]:
+    """Return a list of missing system tools."""
+    missing = []
+    gs_candidates = ("gswin64c", "gswin64", "gs") if sys.platform == "win32" else ("gs",)
+    for tool in ("tesseract", "pdftoppm"):
+        if shutil.which(tool) is None:
+            missing.append(tool)
+    if not any(shutil.which(g) for g in gs_candidates):
+        missing.append("gs")
+    return missing
+
+
+def open_folder(folder: str):
+    """Open a folder in the system file manager."""
+    if folder and os.path.isdir(folder):
+        if sys.platform == "win32":
+            os.startfile(folder)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+
+
+# ===========================================================================
+# Phase 1: Document Preparation — pipeline functions
+# ===========================================================================
+def render_page_to_image(pdf_path: str, page_num: int = 0, dpi: int = OCR_DPI) -> Image.Image:
+    images = convert_from_path(pdf_path, first_page=page_num + 1, last_page=page_num + 1, dpi=dpi)
+    return images[0]
+
+
+def detect_orientation(image: Image.Image) -> tuple[int, float]:
+    try:
+        osd = pytesseract.image_to_osd(image, output_type=pytesseract.Output.DICT)
+        rotate = osd.get("rotate", 0)
+        confidence = float(osd.get("orientation_conf", 0.0))
+        return rotate, confidence
+    except pytesseract.TesseractError:
+        return 0, 0.0
+
+
+def rotate_image(image: Image.Image, degrees: int) -> Image.Image:
+    if degrees == 0:
+        return image
+    return image.rotate(-degrees, expand=True)
+
+
+def deskew_image_pil(image: Image.Image) -> tuple[Image.Image, float]:
+    try:
+        import numpy as np
+        from deskew import determine_skew
+        gray = np.array(image.convert("L"))
+        angle = determine_skew(gray)
+        if angle is not None and abs(angle) > 0.3:
+            corrected = image.rotate(angle, expand=True, fillcolor="white")
+            return corrected, round(angle, 2)
+    except ImportError:
+        pass
+    except Exception as e:
+        logging.debug(f"Deskew failed: {e}")
+    return image, 0.0
+
+
+def ocr_image_to_pdf_bytes(image: Image.Image) -> bytes:
+    return pytesseract.image_to_pdf_or_hocr(image, extension="pdf")
+
+
+def create_single_page_pdf(reader: PdfReader, page_index: int, output_path: str):
+    writer = PdfWriter()
+    writer.add_page(reader.pages[page_index])
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+
+def apply_rotation_to_pdf(input_pdf: str, degrees: int, output_pdf: str):
+    reader = PdfReader(input_pdf)
+    writer = PdfWriter()
+    page = reader.pages[0]
+    page.rotate(degrees)
+    writer.add_page(page)
+    with open(output_pdf, "wb") as f:
+        writer.write(f)
+
+
+def apply_ocr_to_pdf(input_pdf: str, output_pdf: str, force_ocr: bool = True) -> bool:
+    try:
+        import ocrmypdf
+        ocrmypdf.ocr(input_pdf, output_pdf, language="eng", force_ocr=force_ocr, optimize=1)
+        return True
+    except ImportError:
+        return False
+    except Exception as e:
+        logging.warning(f"ocrmypdf failed: {e}, falling back to manual OCR")
+        return False
+
+
+def process_page(
+    source_pdf_path: str,
+    page_index: int,
+    total_pages: int,
+    output_dir: str,
+    images_dir: str,
+    page_counter: int,
+) -> PageRecord:
+    source_basename = os.path.basename(source_pdf_path)
+    stem = Path(source_pdf_path).stem
+    page_id = f"{stem}_page_{page_index + 1:04d}"
+
+    notes = []
+    temp_files = []
+
+    try:
+        reader = PdfReader(source_pdf_path)
+        temp_single = os.path.join(output_dir, f"_temp_{page_id}.pdf")
+        create_single_page_pdf(reader, page_index, temp_single)
+        temp_files.append(temp_single)
+
+        embedded_text = extract_page_text(temp_single, 0)
+        has_text = len(embedded_text) >= TEXT_THRESHOLD
+
+        if has_text:
+            notes.append(f"Embedded text found ({len(embedded_text)} chars)")
+        else:
+            notes.append(f"No usable embedded text ({len(embedded_text)} chars)")
+
+        page_image = render_page_to_image(temp_single, 0, dpi=OCR_DPI)
+
+        rotation_needed, osd_confidence = detect_orientation(page_image)
+        notes.append(f"OSD: rotate={rotation_needed}°, conf={osd_confidence:.1f}")
+
+        actual_rotation = 0
+        if osd_confidence >= ORIENTATION_CONFIDENCE and rotation_needed != 0:
+            actual_rotation = rotation_needed
+            notes.append(f"Applying {actual_rotation}° rotation")
+        elif rotation_needed != 0:
+            notes.append(f"Low confidence ({osd_confidence:.1f}), skipping rotation")
+
+        corrected_image = rotate_image(page_image, actual_rotation)
+
+        corrected_image, deskew_angle = deskew_image_pil(corrected_image)
+        if deskew_angle:
+            notes.append(f"Image deskew: {deskew_angle:.2f}°")
+
+        image_path = os.path.join(images_dir, f"{page_id}.png")
+        corrected_image.save(image_path, "PNG")
+
+        output_pdf_path = os.path.join(output_dir, f"{page_id}.pdf")
+
+        if deskew_angle:
+            pdf_bytes = ocr_image_to_pdf_bytes(corrected_image)
+            with open(output_pdf_path, "wb") as f:
+                f.write(pdf_bytes)
+            notes.append("PDF rebuilt from deskewed image via Tesseract")
+            ocr_applied = True
+
+        elif has_text and actual_rotation == 0:
+            shutil.copy2(temp_single, output_pdf_path)
+            ocr_applied = False
+            notes.append("Kept original PDF (no corrections needed)")
+
+        elif has_text and actual_rotation != 0:
+            apply_rotation_to_pdf(temp_single, actual_rotation, output_pdf_path)
+            ocr_applied = False
+            notes.append("Rotated existing PDF")
+
+        else:
+            if actual_rotation != 0:
+                rotated_temp = os.path.join(output_dir, f"_temp_rot_{page_id}.pdf")
+                apply_rotation_to_pdf(temp_single, actual_rotation, rotated_temp)
+                temp_files.append(rotated_temp)
+                ocr_input = rotated_temp
+            else:
+                ocr_input = temp_single
+
+            ocr_success = apply_ocr_to_pdf(ocr_input, output_pdf_path, force_ocr=True)
+            if not ocr_success:
+                pdf_bytes = ocr_image_to_pdf_bytes(corrected_image)
+                with open(output_pdf_path, "wb") as f:
+                    f.write(pdf_bytes)
+                notes.append("OCR via Tesseract direct (ocrmypdf unavailable)")
+            else:
+                notes.append("OCR via ocrmypdf")
+            ocr_applied = True
+
+        final_text = extract_page_text(output_pdf_path, 0)
+
+        return PageRecord(
+            page_id=page_id,
+            source_pdf=source_pdf_path,
+            source_pdf_basename=source_basename,
+            original_page=page_index + 1,
+            total_source_pages=total_pages,
+            orientation_detected=rotation_needed,
+            orientation_correction=actual_rotation,
+            orientation_confidence=osd_confidence,
+            had_text=has_text,
+            ocr_applied=ocr_applied,
+            text_length=len(final_text),
+            output_pdf=output_pdf_path,
+            output_image=image_path,
+            processing_notes=notes,
+        )
+
+    finally:
+        for tf in temp_files:
+            try:
+                if os.path.exists(tf):
+                    os.remove(tf)
+            except OSError:
+                pass
+
+
+def discover_pdfs(folder: str) -> list[str]:
+    pdfs = []
+    for entry in sorted(os.listdir(folder)):
+        if entry.lower().endswith(".pdf"):
+            pdfs.append(os.path.join(folder, entry))
+    return pdfs
+
+
+def count_total_pages(pdf_paths: list[str]) -> int:
+    total = 0
+    for p in pdf_paths:
+        try:
+            reader = PdfReader(p)
+            total += len(reader.pages)
+        except Exception:
+            pass
+    return total
+
+
+def run_phase1(
+    input_folder: str,
+    output_folder: str,
+    recursive: bool = False,
+    progress_callback=None,
+    log_callback=None,
+    cancel_event: threading.Event = None,
+) -> list[PageRecord]:
+    """Main Phase 1 pipeline."""
+
+    def log(msg):
+        logging.info(msg)
+        if log_callback:
+            log_callback(msg)
+
+    def progress(current, total, msg=""):
+        if progress_callback:
+            progress_callback(current, total, msg)
+
+    if recursive:
+        pdf_paths = []
+        for root, _, files in os.walk(input_folder):
+            for f in sorted(files):
+                if f.lower().endswith(".pdf"):
+                    pdf_paths.append(os.path.join(root, f))
+    else:
+        pdf_paths = discover_pdfs(input_folder)
+
+    if not pdf_paths:
+        log("No PDF files found in the selected folder.")
+        return []
+
+    log(f"Found {len(pdf_paths)} PDF file(s)")
+
+    total_pages = count_total_pages(pdf_paths)
+    log(f"Total pages to process: {total_pages}")
+
+    pages_dir = os.path.join(output_folder, "pages")
+    images_dir = os.path.join(output_folder, "images")
+    os.makedirs(pages_dir, exist_ok=True)
+    os.makedirs(images_dir, exist_ok=True)
+
+    records = []
+    page_counter = 0
+
+    for pdf_path in pdf_paths:
+        if cancel_event and cancel_event.is_set():
+            log("Processing cancelled by user.")
+            break
+
+        try:
+            reader = PdfReader(pdf_path)
+            num_pages = len(reader.pages)
+        except Exception as e:
+            log(f"ERROR: Cannot read '{os.path.basename(pdf_path)}': {e}")
+            continue
+
+        log(f"Processing: {os.path.basename(pdf_path)} ({num_pages} pages)")
+
+        for page_idx in range(num_pages):
+            if cancel_event and cancel_event.is_set():
+                break
+
+            page_counter += 1
+            progress(page_counter, total_pages,
+                     f"{os.path.basename(pdf_path)} p.{page_idx + 1}/{num_pages}")
+
+            try:
+                record = process_page(
+                    source_pdf_path=pdf_path,
+                    page_index=page_idx,
+                    total_pages=num_pages,
+                    output_dir=pages_dir,
+                    images_dir=images_dir,
+                    page_counter=page_counter,
+                )
+                records.append(record)
+
+                status = "OCR" if record.ocr_applied else "TEXT"
+                rot = f" rot:{record.orientation_correction}°" if record.orientation_correction else ""
+                log(f"  Page {page_idx + 1}: [{status}]{rot} → {record.page_id}.pdf "
+                    f"({record.text_length} chars)")
+
+            except Exception as e:
+                log(f"  ERROR on page {page_idx + 1}: {e}")
+                logging.exception(f"Failed processing {pdf_path} page {page_idx}")
+
+    manifest_path = os.path.join(output_folder, "manifest.json")
+    manifest_data = {
+        "created": datetime.now().isoformat(),
+        "input_folder": input_folder,
+        "output_folder": output_folder,
+        "total_source_files": len(pdf_paths),
+        "total_pages_processed": len(records),
+        "pages": [asdict(r) for r in records],
+    }
+    with open(manifest_path, "w") as f:
+        json.dump(manifest_data, f, indent=2)
+
+    log(f"\nDone! Processed {len(records)} pages from {len(pdf_paths)} file(s)")
+    log(f"Output: {output_folder}")
+    log(f"Manifest: {manifest_path}")
+
+    return records
+
+
+# ===========================================================================
+# Phase 2: Vision Extraction — pipeline functions
+# ===========================================================================
 def _build_extraction_prompt(base_prompt: str, ordered_page_ids: list[str]) -> str:
     if len(ordered_page_ids) <= 1:
         return base_prompt
@@ -184,17 +582,15 @@ def _merge_two_page_rescue(primary: dict, page1: dict, page2: dict) -> dict:
         "customer_name", "customer_address",
         "purchase_order_number", "currency", "notes",
     ]
-    for field in text_fields:
-        merged[field] = _first_non_empty(
-            primary.get(field), page1.get(field), page2.get(field)
-        )
+    for f in text_fields:
+        merged[f] = _first_non_empty(primary.get(f), page1.get(f), page2.get(f))
 
     amount_fields = ["subtotal", "shipping", "gst", "pst", "hst", "other_taxes", "total"]
-    for field in amount_fields:
-        merged[field] = _first_non_empty(
-            _to_float(primary.get(field)),
-            _to_float(page2.get(field)),
-            _to_float(page1.get(field)),
+    for f in amount_fields:
+        merged[f] = _first_non_empty(
+            _to_float(primary.get(f)),
+            _to_float(page2.get(f)),
+            _to_float(page1.get(f)),
         )
 
     if not isinstance(merged.get("line_items"), list):
@@ -204,10 +600,10 @@ def _merge_two_page_rescue(primary: dict, page1: dict, page2: dict) -> dict:
     if not isinstance(uncertain, list):
         uncertain = []
     resolved = set()
-    for field in text_fields + amount_fields:
-        val = merged.get(field)
+    for f in text_fields + amount_fields:
+        val = merged.get(f)
         if val is not None and (not isinstance(val, str) or val.strip()):
-            resolved.add(field)
+            resolved.add(f)
     merged["fields_uncertain"] = [f for f in uncertain if f not in resolved]
 
     primary_conf = float(primary.get("extraction_confidence", 0.0) or 0.0)
@@ -220,9 +616,6 @@ def _merge_two_page_rescue(primary: dict, page1: dict, page2: dict) -> dict:
     return merged
 
 
-# ---------------------------------------------------------------------------
-# Step 1: Classify pages using VISION
-# ---------------------------------------------------------------------------
 def classify_pages(
     manifest: dict,
     client: OllamaClient,
@@ -231,7 +624,6 @@ def classify_pages(
     progress_callback=None,
     cancel_event: threading.Event = None,
 ) -> list[PageClassification]:
-    """Classify each page by sending its image to the vision model."""
 
     def log(msg):
         logging.info(msg)
@@ -255,7 +647,6 @@ def classify_pages(
         if progress_callback:
             progress_callback(i + 1, total, f"Classifying {page_id}")
 
-        # Check image exists
         if not image_path or not os.path.exists(image_path):
             log(f"  {page_id}: No image found — classifying as unknown")
             classifications.append(PageClassification(
@@ -268,9 +659,8 @@ def classify_pages(
             ))
             continue
 
-        # Build prompt — optionally include OCR text as supplementary context
         if include_ocr_text and pdf_path and os.path.exists(pdf_path):
-            ocr_text = get_page_text(pdf_path)
+            ocr_text = extract_page_text(pdf_path)
             if len(ocr_text) > 20:
                 prompt = CLASSIFY_PAGE_WITH_TEXT_PROMPT.format(
                     page_text=truncate_text(ocr_text)
@@ -318,15 +708,11 @@ def classify_pages(
     return classifications
 
 
-# ---------------------------------------------------------------------------
-# Step 2: Group pages (text-based — uses classification metadata)
-# ---------------------------------------------------------------------------
 def group_pages(
     classifications: list[PageClassification],
     client: OllamaClient,
     log_callback=None,
 ) -> list[InvoiceGroup]:
-    """Group classified pages into invoices. This step is text-based (no images)."""
 
     def log(msg):
         logging.info(msg)
@@ -355,9 +741,8 @@ def group_pages(
         prompt = GROUP_PAGES_PROMPT.format(pages_json=json.dumps(chunk, indent=2))
 
         success = False
-        for attempt in range(2):  # one retry before fallback
+        for attempt in range(2):
             try:
-                # Grouping is text-only — no images needed
                 result = client.generate_json(prompt, system=SYSTEM_PROMPT, timeout=600)
                 raw_groups = result.get("groups", [])
 
@@ -389,7 +774,6 @@ def group_pages(
             )
             group_id_counter = max((g.group_id for g in all_groups), default=0) + 1
 
-    # Catch ungrouped pages
     grouped_ids = set()
     for g in all_groups:
         grouped_ids.update(g.page_ids)
@@ -415,7 +799,6 @@ def group_pages(
 
 
 def _fallback_grouping(classifications, start_id):
-    """Simple fallback: each first_page starts a group, continuations follow."""
     groups = []
     current = None
     gid = start_id
@@ -450,9 +833,6 @@ def _fallback_grouping(classifications, start_id):
     return groups
 
 
-# ---------------------------------------------------------------------------
-# Step 3: Extract fields using VISION
-# ---------------------------------------------------------------------------
 def extract_invoice_fields(
     groups: list[InvoiceGroup],
     manifest: dict,
@@ -462,14 +842,12 @@ def extract_invoice_fields(
     progress_callback=None,
     cancel_event: threading.Event = None,
 ) -> list[InvoiceRecord]:
-    """Extract structured fields by sending invoice page images to the vision model."""
 
     def log(msg):
         logging.info(msg)
         if log_callback:
             log_callback(msg)
 
-    # Build lookups from page_id to image/pdf paths
     page_image_map = {}
     page_pdf_map = {}
     for p in manifest.get("pages", []):
@@ -494,7 +872,6 @@ def extract_invoice_fields(
         if group.invoice_number:
             inv_label += f" (INV#{group.invoice_number})"
 
-        # Collect image paths for all pages in this group
         image_paths = []
         source_files = set()
         ocr_texts = []
@@ -510,7 +887,7 @@ def extract_invoice_fields(
                 image_paths.append(img)
             pdf = page_pdf_map.get(page_id, "")
             if include_ocr_text and pdf and os.path.exists(pdf):
-                text = get_page_text(pdf)
+                text = extract_page_text(pdf)
                 if text:
                     ocr_texts.append(f"--- {page_id} ---\n{text}")
             for p in group.pages:
@@ -521,13 +898,10 @@ def extract_invoice_fields(
             log(f"  {inv_label}: No images — skipping")
             continue
 
-        # Limit images per call to avoid VRAM issues
-        # For invoices with many pages, send first N images
         if len(image_paths) > MAX_IMAGES_PER_EXTRACTION:
             log(f"  {inv_label}: {len(image_paths)} pages, sending first {MAX_IMAGES_PER_EXTRACTION}")
             image_paths = image_paths[:MAX_IMAGES_PER_EXTRACTION]
 
-        # Build prompt — include OCR text as supplementary context if available
         combined_ocr = "\n".join(ocr_texts)
         if combined_ocr and len(combined_ocr) > 30:
             base_prompt = EXTRACT_FIELDS_WITH_TEXT_PROMPT.format(
@@ -549,7 +923,7 @@ def extract_invoice_fields(
             try:
                 result = client.generate_json_with_image(
                     prompt=EXTRACT_KEY_FIELDS_PROMPT,
-                    image_paths=image_paths[:1],  # just first page
+                    image_paths=image_paths[:1],
                     system=SYSTEM_PROMPT,
                     timeout=180,
                 )
@@ -582,7 +956,6 @@ def extract_invoice_fields(
             except OllamaError as rescue_error:
                 log(f"  {inv_label}: Rescue pass failed - {rescue_error}")
 
-        # Summarize line items
         line_items = result.get("line_items", [])
         if isinstance(line_items, list) and line_items:
             items_summary = "; ".join(
@@ -626,7 +999,6 @@ def extract_invoice_fields(
         log(f"  {inv_label}: {record.supplier_name or '?'} → ${record.total or '?'} "
             f"(conf:{conf_pct})")
 
-    # Also add supporting document groups
     for group in groups:
         if group.group_type != "invoice":
             records.append(InvoiceRecord(
@@ -649,9 +1021,9 @@ def extract_invoice_fields(
     return records
 
 
-# ---------------------------------------------------------------------------
-# Output: CSV
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Output writers
+# ===========================================================================
 CSV_COLUMNS = [
     "group_id", "group_type", "invoice_number", "invoice_date", "due_date",
     "supplier_name", "supplier_address", "customer_name", "customer_address",
@@ -674,9 +1046,6 @@ def write_csv(records: list[InvoiceRecord], output_path: str):
             writer.writerow({k: row.get(k) for k in CSV_COLUMNS})
 
 
-# ---------------------------------------------------------------------------
-# Output: XLSX
-# ---------------------------------------------------------------------------
 def write_xlsx(records: list[InvoiceRecord], output_path: str):
     wb = Workbook()
     ws = wb.active
@@ -769,9 +1138,6 @@ def write_xlsx(records: list[InvoiceRecord], output_path: str):
     wb.save(output_path)
 
 
-# ---------------------------------------------------------------------------
-# Full Phase 2 pipeline
-# ---------------------------------------------------------------------------
 def run_phase2(
     manifest_path: str,
     output_dir: str,
@@ -796,7 +1162,6 @@ def run_phase2(
     total_pages = len(manifest.get("pages", []))
     log(f"Manifest has {total_pages} pages from {manifest.get('total_source_files', '?')} file(s)")
 
-    # Verify images exist
     images_found = sum(
         1 for p in manifest.get("pages", [])
         if os.path.exists(p.get("output_image", ""))
@@ -807,7 +1172,6 @@ def run_phase2(
         log("ERROR: No page images found. Did Phase 1 run successfully?")
         return None
 
-    # Connect to Ollama
     client = OllamaClient(base_url=ollama_url, model=model)
     log(f"Connecting to Ollama at {ollama_url} with model {model}...")
 
@@ -898,7 +1262,6 @@ def run_phase2(
         json.dump([asdict(r) for r in records], f, indent=2, default=str)
     log(f"JSON → {json_path}")
 
-    # Summary
     invoice_count = sum(1 for r in records if r.group_type == "invoice")
     support_count = sum(1 for r in records if r.group_type != "invoice")
     high_conf = sum(1 for r in records if r.group_type == "invoice" and r.extraction_confidence >= 0.7)
@@ -916,74 +1279,28 @@ def run_phase2(
 
 
 # ===========================================================================
-# GUI
+# GUI — Base tab with shared widgets
 # ===========================================================================
-class Phase2GUI:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("PDF Invoice Processor — Phase 2: Vision Extraction")
-        self.root.geometry("850x750")
-        self.root.minsize(720, 600)
+class BaseTab(ttk.Frame):
+    """Shared GUI skeleton: progress bar, log text, start/cancel/open buttons."""
 
-        self.manifest_path = tk.StringVar()
-        self.output_folder = tk.StringVar()
-        self.ollama_url = tk.StringVar(value="http://192.168.1.101:11434")
-        self.model_name = tk.StringVar(value="qwen3-vl:8b")
-        self.include_ocr = tk.BooleanVar(value=True)
+    def __init__(self, parent, start_label="Start"):
+        super().__init__(parent, padding=10)
         self.processing = False
         self.cancel_event = threading.Event()
+        self._start_label = start_label
+        self._build_base_widgets()
 
-        self._build_ui()
+    def _build_base_widgets(self):
+        """Create the common bottom section: progress, buttons, log."""
+        # Subclasses add their own widgets first, then call _build_base_widgets
+        # via _finish_layout() after adding custom controls.
+        pass
 
-    def _build_ui(self):
-        main = ttk.Frame(self.root, padding=10)
-        main.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(main, text="PDF Invoice Processor — Phase 2",
-                  font=("Segoe UI", 16, "bold")).pack(pady=(0, 2))
-        ttk.Label(main,
-                  text="Classify · Group · Extract — Vision model via Ollama (100% local)",
-                  font=("Segoe UI", 10)).pack(pady=(0, 10))
-
-        # --- Ollama settings ---
-        ollama_frame = ttk.LabelFrame(main, text="Ollama Settings", padding=5)
-        ollama_frame.pack(fill=tk.X, pady=(0, 5))
-
-        row1 = ttk.Frame(ollama_frame)
-        row1.pack(fill=tk.X, pady=2)
-        ttk.Label(row1, text="URL:").pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Entry(row1, textvariable=self.ollama_url, width=30).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(row1, text="Model:").pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Entry(row1, textvariable=self.model_name, width=20).pack(side=tk.LEFT, padx=(0, 10))
-        self.ollama_status = ttk.Label(row1, text="")
-        self.ollama_status.pack(side=tk.LEFT)
-        ttk.Button(row1, text="Test", command=self._test_ollama).pack(side=tk.RIGHT)
-
-        row2 = ttk.Frame(ollama_frame)
-        row2.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(row2, text="Include OCR text as supplementary context (recommended)",
-                        variable=self.include_ocr).pack(anchor=tk.W)
-
-        # --- Input ---
-        input_frame = ttk.LabelFrame(main, text="Phase 1 Output (manifest.json)", padding=5)
-        input_frame.pack(fill=tk.X, pady=(0, 5))
-        input_row = ttk.Frame(input_frame)
-        input_row.pack(fill=tk.X)
-        ttk.Entry(input_row, textvariable=self.manifest_path).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ttk.Button(input_row, text="Browse…", command=self._browse_manifest).pack(side=tk.RIGHT)
-
-        # --- Output ---
-        output_frame = ttk.LabelFrame(main, text="Output Folder", padding=5)
-        output_frame.pack(fill=tk.X, pady=(0, 5))
-        output_row = ttk.Frame(output_frame)
-        output_row.pack(fill=tk.X)
-        ttk.Entry(output_row, textvariable=self.output_folder).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ttk.Button(output_row, text="Browse…", command=self._browse_output).pack(side=tk.RIGHT)
-
+    def _finish_layout(self):
+        """Call this at the end of subclass _build_ui to add progress/buttons/log."""
         # --- Progress ---
-        prog_frame = ttk.LabelFrame(main, text="Progress", padding=5)
+        prog_frame = ttk.LabelFrame(self, text="Progress", padding=5)
         prog_frame.pack(fill=tk.X, pady=(0, 5))
         self.progress_label = ttk.Label(prog_frame, text="Ready")
         self.progress_label.pack(anchor=tk.W)
@@ -991,9 +1308,9 @@ class Phase2GUI:
         self.progress_bar.pack(fill=tk.X, pady=(3, 0))
 
         # --- Buttons ---
-        btn_frame = ttk.Frame(main)
+        btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, pady=(5, 5))
-        self.start_btn = ttk.Button(btn_frame, text="▶  Start Extraction",
+        self.start_btn = ttk.Button(btn_frame, text=f"▶  {self._start_label}",
                                     command=self._start_processing)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 5))
         self.cancel_btn = ttk.Button(btn_frame, text="■  Cancel",
@@ -1004,27 +1321,206 @@ class Phase2GUI:
         self.open_btn.pack(side=tk.RIGHT)
 
         # --- Log ---
-        log_frame = ttk.LabelFrame(main, text="Processing Log", padding=5)
+        log_frame = ttk.LabelFrame(self, text="Processing Log", padding=5)
         log_frame.pack(fill=tk.BOTH, expand=True)
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=14, wrap=tk.WORD,
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=12, wrap=tk.WORD,
                                                    font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-    def _test_ollama(self):
-        url = self.ollama_url.get().strip()
-        model = self.model_name.get().strip()
-        client = OllamaClient(base_url=url, model=model)
+    def _start_processing(self):
+        """Override in subclass."""
+        pass
 
-        if client.is_available():
-            self.ollama_status.config(text="✓ Connected (vision)", foreground="green")
-        else:
-            models = client.list_models()
-            if models:
-                self.ollama_status.config(
-                    text=f"⚠ Not found. Have: {', '.join(models[:5])}",
-                    foreground="orange")
+    def _cancel(self):
+        self.cancel_event.set()
+        self._append_log("Cancelling...")
+
+    def _open_output(self):
+        """Override in subclass to provide the folder path."""
+        pass
+
+    def _set_running(self, running: bool):
+        self.processing = running
+        self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.cancel_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+        if not running:
+            self.open_btn.config(state=tk.NORMAL)
+
+    def _update_progress(self, current, total, msg):
+        def _u():
+            pct = (current / total * 100) if total > 0 else 0
+            self.progress_bar["value"] = pct
+            self.progress_label.config(text=f"[{current}/{total}] {msg}")
+        self.winfo_toplevel().after(0, _u)
+
+    def _append_log(self, message):
+        def _a():
+            self.log_text.insert(tk.END, message + "\n")
+            self.log_text.see(tk.END)
+        self.winfo_toplevel().after(0, _a)
+
+
+# ===========================================================================
+# GUI — Phase 1 Tab
+# ===========================================================================
+class Phase1Tab(BaseTab):
+    def __init__(self, parent, app):
+        self.app = app
+        super().__init__(parent, start_label="Start Processing")
+        self._build_ui()
+
+    def _build_ui(self):
+        self.input_folder = tk.StringVar()
+        self.output_folder = tk.StringVar()
+        self.recursive = tk.BooleanVar(value=False)
+
+        # --- Dependency status ---
+        dep_frame = ttk.LabelFrame(self, text="System Dependencies", padding=5)
+        dep_frame.pack(fill=tk.X, pady=(0, 10))
+        self.dep_label = ttk.Label(dep_frame, text="Checking...")
+        self.dep_label.pack(anchor=tk.W)
+        self._check_dependencies()
+
+        # --- Input folder ---
+        input_frame = ttk.LabelFrame(self, text="Input Folder (containing PDFs)", padding=5)
+        input_frame.pack(fill=tk.X, pady=(0, 5))
+        input_row = ttk.Frame(input_frame)
+        input_row.pack(fill=tk.X)
+        ttk.Entry(input_row, textvariable=self.input_folder).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(input_row, text="Browse…", command=self._browse_input).pack(side=tk.RIGHT)
+        ttk.Checkbutton(input_frame, text="Include subfolders (recursive)",
+                        variable=self.recursive).pack(anchor=tk.W, pady=(3, 0))
+
+        # --- Output folder ---
+        output_frame = ttk.LabelFrame(self, text="Output Folder", padding=5)
+        output_frame.pack(fill=tk.X, pady=(0, 5))
+        output_row = ttk.Frame(output_frame)
+        output_row.pack(fill=tk.X)
+        ttk.Entry(output_row, textvariable=self.output_folder).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(output_row, text="Browse…", command=self._browse_output).pack(side=tk.RIGHT)
+
+        self._finish_layout()
+
+    def _check_dependencies(self):
+        missing = check_system_dependencies()
+        if missing:
+            tool_names = {"tesseract": "tesseract-ocr", "pdftoppm": "poppler-utils", "gs": "ghostscript"}
+            packages = [tool_names.get(t, t) for t in missing]
+            if sys.platform == "win32":
+                install_hint = "Download from: https://github.com/UB-Mannheim/tesseract/wiki (tesseract), https://github.com/oschwartz10612/poppler-windows (poppler), https://www.ghostscript.com/download.html (ghostscript)"
             else:
-                self.ollama_status.config(text="✗ Cannot reach Ollama", foreground="red")
+                install_hint = f"Install with: sudo apt install {' '.join(packages)}"
+            self.dep_label.config(
+                text=f"⚠ Missing: {', '.join(packages)}. {install_hint}",
+                foreground="red",
+            )
+        else:
+            self.dep_label.config(text="✓ All dependencies found (tesseract, poppler, ghostscript)",
+                                  foreground="green")
+
+    def _browse_input(self):
+        folder = filedialog.askdirectory(title="Select folder containing PDFs")
+        if folder:
+            self.input_folder.set(folder)
+            if not self.output_folder.get():
+                self.output_folder.set(os.path.join(folder, "processed_output"))
+
+    def _browse_output(self):
+        folder = filedialog.askdirectory(title="Select output folder")
+        if folder:
+            self.output_folder.set(folder)
+
+    def _start_processing(self):
+        input_dir = self.input_folder.get().strip()
+        output_dir = self.output_folder.get().strip()
+
+        if not input_dir or not os.path.isdir(input_dir):
+            messagebox.showerror("Error", "Please select a valid input folder.")
+            return
+        if not output_dir:
+            messagebox.showerror("Error", "Please select an output folder.")
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+        self.log_text.delete("1.0", tk.END)
+        self.progress_bar["value"] = 0
+        self.cancel_event.clear()
+        self._set_running(True)
+
+        thread = threading.Thread(target=self._run_thread,
+                                  args=(input_dir, output_dir), daemon=True)
+        thread.start()
+
+    def _run_thread(self, input_dir, output_dir):
+        try:
+            records = run_phase1(
+                input_folder=input_dir,
+                output_folder=output_dir,
+                recursive=self.recursive.get(),
+                progress_callback=self._update_progress,
+                log_callback=self._append_log,
+                cancel_event=self.cancel_event,
+            )
+            self.winfo_toplevel().after(0, self._done, len(records), output_dir)
+        except Exception as e:
+            self.winfo_toplevel().after(0, self._error, str(e))
+
+    def _done(self, count, output_dir):
+        self._set_running(False)
+        self.progress_label.config(text=f"Complete — {count} pages processed")
+        self.progress_bar["value"] = 100
+
+        # Auto-populate Phase 2 manifest path
+        manifest_path = os.path.join(output_dir, "manifest.json")
+        if os.path.isfile(manifest_path):
+            self.app.phase2_tab.manifest_path.set(manifest_path)
+            if not self.app.phase2_tab.output_folder.get():
+                self.app.phase2_tab.output_folder.set(
+                    os.path.join(output_dir, "extraction_output"))
+            self._append_log(f"\nPhase 2 manifest auto-set → switch to Extraction tab to continue")
+
+    def _error(self, msg):
+        self._set_running(False)
+        messagebox.showerror("Processing Error", f"An error occurred:\n{msg}")
+
+    def _open_output(self):
+        open_folder(self.output_folder.get())
+
+
+# ===========================================================================
+# GUI — Phase 2 Tab
+# ===========================================================================
+class Phase2Tab(BaseTab):
+    def __init__(self, parent, app):
+        self.app = app
+        super().__init__(parent, start_label="Start Extraction")
+        self._build_ui()
+
+    def _build_ui(self):
+        self.manifest_path = tk.StringVar()
+        self.output_folder = tk.StringVar()
+
+        # --- Input ---
+        input_frame = ttk.LabelFrame(self, text="Phase 1 Output (manifest.json)", padding=5)
+        input_frame.pack(fill=tk.X, pady=(0, 5))
+        input_row = ttk.Frame(input_frame)
+        input_row.pack(fill=tk.X)
+        ttk.Entry(input_row, textvariable=self.manifest_path).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(input_row, text="Browse…", command=self._browse_manifest).pack(side=tk.RIGHT)
+
+        # --- Output ---
+        output_frame = ttk.LabelFrame(self, text="Output Folder", padding=5)
+        output_frame.pack(fill=tk.X, pady=(0, 5))
+        output_row = ttk.Frame(output_frame)
+        output_row.pack(fill=tk.X)
+        ttk.Entry(output_row, textvariable=self.output_folder).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(output_row, text="Browse…", command=self._browse_output).pack(side=tk.RIGHT)
+
+        self._finish_layout()
 
     def _browse_manifest(self):
         path = filedialog.askopenfilename(
@@ -1056,10 +1552,7 @@ class Phase2GUI:
         self.log_text.delete("1.0", tk.END)
         self.progress_bar["value"] = 0
         self.cancel_event.clear()
-        self.processing = True
-        self.start_btn.config(state=tk.DISABLED)
-        self.cancel_btn.config(state=tk.NORMAL)
-        self.open_btn.config(state=tk.DISABLED)
+        self._set_running(True)
 
         thread = threading.Thread(target=self._run_thread,
                                   args=(manifest, output), daemon=True)
@@ -1070,26 +1563,19 @@ class Phase2GUI:
             result = run_phase2(
                 manifest_path=manifest_path,
                 output_dir=output_dir,
-                ollama_url=self.ollama_url.get().strip(),
-                model=self.model_name.get().strip(),
-                include_ocr_text=self.include_ocr.get(),
+                ollama_url=self.app.settings_tab.ollama_url.get().strip(),
+                model=self.app.settings_tab.model_name.get().strip(),
+                include_ocr_text=self.app.settings_tab.include_ocr.get(),
                 log_callback=self._append_log,
                 progress_callback=self._update_progress,
                 cancel_event=self.cancel_event,
             )
-            self.root.after(0, self._done, result)
+            self.winfo_toplevel().after(0, self._done, result)
         except Exception as e:
-            self.root.after(0, self._error, str(e))
-
-    def _cancel(self):
-        self.cancel_event.set()
-        self._append_log("Cancelling...")
+            self.winfo_toplevel().after(0, self._error, str(e))
 
     def _done(self, result_path):
-        self.processing = False
-        self.start_btn.config(state=tk.NORMAL)
-        self.cancel_btn.config(state=tk.DISABLED)
-        self.open_btn.config(state=tk.NORMAL)
+        self._set_running(False)
         self.progress_bar["value"] = 100
         if result_path:
             self.progress_label.config(text=f"Complete → {os.path.basename(result_path)}")
@@ -1097,47 +1583,122 @@ class Phase2GUI:
             self.progress_label.config(text="Completed with errors — check log")
 
     def _error(self, msg):
-        self.processing = False
-        self.start_btn.config(state=tk.NORMAL)
-        self.cancel_btn.config(state=tk.DISABLED)
+        self._set_running(False)
         messagebox.showerror("Error", msg)
 
-    def _update_progress(self, current, total, msg):
-        def _u():
-            pct = (current / total * 100) if total > 0 else 0
-            self.progress_bar["value"] = pct
-            self.progress_label.config(text=f"[{current}/{total}] {msg}")
-        self.root.after(0, _u)
-
-    def _append_log(self, message):
-        def _a():
-            self.log_text.insert(tk.END, message + "\n")
-            self.log_text.see(tk.END)
-        self.root.after(0, _a)
-
     def _open_output(self):
-        folder = self.output_folder.get()
-        if folder and os.path.isdir(folder):
-            if sys.platform == "win32":
-                os.startfile(folder)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
+        open_folder(self.output_folder.get())
+
+
+# ===========================================================================
+# GUI — Settings Tab
+# ===========================================================================
+class SettingsTab(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, padding=10)
+        self.ollama_url = tk.StringVar(value="http://192.168.1.101:11434")
+        self.model_name = tk.StringVar(value="qwen3-vl:8b")
+        self.include_ocr = tk.BooleanVar(value=True)
+        self._build_ui()
+
+    def _build_ui(self):
+        # --- Ollama settings ---
+        ollama_frame = ttk.LabelFrame(self, text="Ollama Settings", padding=10)
+        ollama_frame.pack(fill=tk.X, pady=(0, 10))
+
+        row1 = ttk.Frame(ollama_frame)
+        row1.pack(fill=tk.X, pady=4)
+        ttk.Label(row1, text="Server URL:").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Entry(row1, textvariable=self.ollama_url, width=35).pack(side=tk.LEFT, padx=(0, 10))
+
+        row2 = ttk.Frame(ollama_frame)
+        row2.pack(fill=tk.X, pady=4)
+        ttk.Label(row2, text="Vision Model:").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Entry(row2, textvariable=self.model_name, width=25).pack(side=tk.LEFT, padx=(0, 10))
+
+        row3 = ttk.Frame(ollama_frame)
+        row3.pack(fill=tk.X, pady=4)
+        self.ollama_status = ttk.Label(row3, text="")
+        self.ollama_status.pack(side=tk.LEFT)
+        ttk.Button(row3, text="Test Connection", command=self._test_ollama).pack(side=tk.RIGHT)
+
+        # --- OCR settings ---
+        ocr_frame = ttk.LabelFrame(self, text="Extraction Settings", padding=10)
+        ocr_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Checkbutton(ocr_frame,
+                        text="Include OCR text as supplementary context (recommended)",
+                        variable=self.include_ocr).pack(anchor=tk.W)
+
+    def _test_ollama(self):
+        url = self.ollama_url.get().strip()
+        model = self.model_name.get().strip()
+        client = OllamaClient(base_url=url, model=model)
+
+        if client.is_available():
+            self.ollama_status.config(text="✓ Connected — model ready", foreground="green")
+        else:
+            models = client.list_models()
+            if models:
+                self.ollama_status.config(
+                    text=f"⚠ Model not found. Available: {', '.join(models[:5])}",
+                    foreground="orange")
             else:
-                subprocess.Popen(["xdg-open", folder])
+                self.ollama_status.config(text="✗ Cannot reach Ollama", foreground="red")
 
 
+# ===========================================================================
+# GUI — Main Application
+# ===========================================================================
+class InvoiceProcessorApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("PDF Invoice Processor")
+        self.root.geometry("860x750")
+        self.root.minsize(720, 600)
+
+        # Apply theme
+        try:
+            style = ttk.Style()
+            for t in ("clam", "alt", "vista", "xpnative"):
+                if t in style.theme_names():
+                    style.theme_use(t)
+                    break
+        except Exception:
+            pass
+
+        # Header
+        header = ttk.Label(root, text="PDF Invoice Processor",
+                           font=("Segoe UI", 16, "bold"))
+        header.pack(pady=(10, 2))
+        subtitle = ttk.Label(root,
+                             text="Split · Orient · OCR · Classify · Extract — 100% Local",
+                             font=("Segoe UI", 10))
+        subtitle.pack(pady=(0, 8))
+
+        # Notebook (tabs)
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        # Settings tab first (so other tabs can reference it)
+        self.settings_tab = SettingsTab(self.notebook)
+
+        # Phase tabs
+        self.phase1_tab = Phase1Tab(self.notebook, self)
+        self.phase2_tab = Phase2Tab(self.notebook, self)
+
+        self.notebook.add(self.phase1_tab, text="  1. Document Preparation  ")
+        self.notebook.add(self.phase2_tab, text="  2. Vision Extraction  ")
+        self.notebook.add(self.settings_tab, text="  Settings  ")
+
+
+# ===========================================================================
+# Entry point
+# ===========================================================================
 def main():
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     root = tk.Tk()
-    try:
-        style = ttk.Style()
-        for t in ("clam", "alt", "vista"):
-            if t in style.theme_names():
-                style.theme_use(t)
-                break
-    except Exception:
-        pass
-    Phase2GUI(root)
+    InvoiceProcessorApp(root)
     root.mainloop()
 
 
